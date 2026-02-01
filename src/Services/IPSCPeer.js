@@ -3,8 +3,9 @@ const XNL = require('../Protocols/XNL');
 const EventEmitter = require('events');
 const udp = require("dgram");
 const { getTime, delay } = require('./Utils');
-const {DMRPayload, WirelineRegistrationEntry} = require("../Protocols/IPSC/types");
-const  { Wireline } = require("../Protocols/IPSC");
+const { DMRPayload, WirelineRegistrationEntry } = require("../Protocols/IPSC/types");
+const { Wireline } = require("../Protocols/IPSC");
+const crypto = require("crypto");
 
 class IPSCPeer extends EventEmitter {
     static STATE_NONE = 0;
@@ -58,15 +59,30 @@ class IPSCPeer extends EventEmitter {
             wlId: options.wlId ?? 0,
             wlCapPusRevert: options.wlCapPusRevert ?? false,
             wlKey: options.wlKey ?? [Buffer.alloc(0), Buffer.alloc(0)],
+            authKey: options.authKey ?? null,
+            authOnWireline: options.authOnWireline ?? false,
         };
-
+        this._authKey20 = this._normalizeAuthKey20(this.options.authKey);
         this.socket = udp.createSocket('udp4');
 
-        this.socket.on('close', () => {
-           // Is it possible on udp socket ?
-        });
         this.socket.on('message', (msg, addr) => {
             this.onData(msg, addr);
+        });
+        this.socket.on("error", (err) => {
+            console.error("[ipsc] SOCKET ERROR:", err);
+        });
+
+        // this.socket.on("close", () => {
+        //     console.error("[ipsc] SOCKET CLOSE event");
+        // });
+        const _origClose = this.socket.close.bind(this.socket);
+        this.socket.close = (...args) => {
+            console.error("[ipsc] socket.close() CALLED!\n", new Error().stack);
+            return _origClose(...args);
+        };
+        this.socket.on("listening", () => {
+            const a = this.socket.address();
+            console.log("[ipsc] listening on", a);
         });
 
         setTimeout(() => {
@@ -75,7 +91,7 @@ class IPSCPeer extends EventEmitter {
     }
 
     connect() {
-        if(this.state!==IPSCPeer.STATE_NONE)
+        if (this.state !== IPSCPeer.STATE_NONE)
             return;
         this.state = IPSCPeer.STATE_CONNECTING;
         this.lostPings = 0;
@@ -126,7 +142,7 @@ class IPSCPeer extends EventEmitter {
     }
 
     close() {
-        if(this.state===IPSCPeer.STATE_NONE)
+        if (this.state === IPSCPeer.STATE_NONE)
             return;
 
         let packet = new IPSC.DeregisterReq();
@@ -138,27 +154,101 @@ class IPSCPeer extends EventEmitter {
 
         this.emit(IPSCPeer.EVENT_CLOSED);
     }
+    _normalizeAuthKey20(authKey) {
+        if (!authKey) return null;
 
-    send(packet, isRevert=false) {
+        let buf;
+        if (Buffer.isBuffer(authKey)) {
+            buf = authKey;
+        } else {
+            const hex = String(authKey)
+                .trim()
+                .replace(/^0x/i, "")
+                .replace(/[^0-9a-fA-F]/g, "");
+            if (!hex.length) return null;
+            buf = Buffer.from(hex, "hex");
+        }
+
+        if (buf.length > 20) {
+            throw new Error(`IPSC authKey too long: ${buf.length} bytes (max 20)`);
+        }
+
+        if (buf.length === 20) return buf;
+
+        // left-pad with zeros to 20 bytes
+        const out = Buffer.alloc(20, 0x00);
+        buf.copy(out, 20 - buf.length);
+        return out;
+    }
+    _hmacsha1_10(key, payload) {
+        const mac20 = crypto.createHmac("sha1", key).update(payload).digest(); // 20 bytes
+        return mac20.subarray(0, 10); // first 10 bytes
+    }
+    _buildIpscAuthDigest(payload) {
+        const key = this._authKey20;
+        if (!key) return null;
+
+        // IPSC authentication: HMAC-SHA1(key, payload) truncated to 10 bytes
+        const mac20 = crypto.createHmac("sha1", key).update(payload).digest(); // 20 bytes
+        return mac20.subarray(0, 10); // most significant 10 bytes
+    }
+
+    _attachIpscAuth(payload) {
+        const d = this._buildIpscAuthDigest(payload);
+        if (!d) return payload;
+        return Buffer.concat([payload, d]);
+    }
+
+    _stripAndVerifyIpscAuth(buffer) {
+        const k = this._authKey20;
+        if (!k) return buffer;
+
+        if (buffer.length < 10) return null;
+
+        const payload = buffer.subarray(0, buffer.length - 10);
+        const got = buffer.subarray(buffer.length - 10);
+
+        const exp = this._hmacsha1_10(k, payload);
+
+        if (crypto.timingSafeEqual(got, exp)) return payload;
+
+        return null;
+    }
+
+    send(packet, isRevert = false) {
         let buffer;
-        if(packet instanceof IPSC.Packet) {
+        if (packet instanceof IPSC.Packet) {
             packet.peerId = this.options.peerId;
 
-            if(packet instanceof Wireline) {
+            if (packet instanceof Wireline) {
                 packet.currentVersion = 5;
                 packet.oldestVersion = 1;
 
                 buffer = packet.getSignedBuffer(this.options.wlKey[0], this.options.wlKey[1]);
-            }  else {
+            } else {
                 buffer = packet.getBuffer();
             }
-        } else if(packet instanceof Buffer) {
+        } else if (packet instanceof Buffer) {
             buffer = packet;
         } else {
             return;
         }
+        // IPSC auth trailer (10 bytes SHA1 digest)
+        console.log("[ipsc] tx len", buffer.length, "type", buffer[0]?.toString(16));
+        if (this._authKey20) {
+            const d = this._buildIpscAuthDigest(buffer);
+            console.log("[ipsc] tx digest", d.toString("hex"));
+        }
+        if (this._authKey20) {
+            const isWirelinePacket = (packet instanceof Wireline);
+            const shouldAuth =
+                (!isWirelinePacket) || (isWirelinePacket && this.options.authOnWireline);
 
-        if(isRevert && this.wlRevertPeer[0]!=='' && this.wlRevertPeer[1] > 0) {
+            // If caller passed Buffer напрямую — считаем что это “сырой IPSC payload”
+            if (shouldAuth) buffer = this._attachIpscAuth(buffer);
+        }
+        console.log("[ipsc] tx final len", buffer.length, "tail10", buffer.subarray(buffer.length - 10).toString("hex"));
+        if (isRevert && this.wlRevertPeer[0] !== '' && this.wlRevertPeer[1] > 0) {
             this.socket.send(buffer, this.wlRevertPeer[1], this.wlRevertPeer[0], (error) => {
 
             });
@@ -170,24 +260,35 @@ class IPSCPeer extends EventEmitter {
     }
 
     onData(buffer, addr) {
-        if(this.state===IPSCPeer.STATE_NONE)
-            return;
-        // console.log('D: '+buffer.toString('hex'));
-        let packet = IPSC.Packet.from(buffer);
+        console.log("[ipsc] rx", buffer.length, "from", addr.address + ":" + addr.port);
 
+        if (this.state === IPSCPeer.STATE_NONE) return;
 
-        if(packet===null)
-            return;
+        // Verify IPSC auth if enabled
+        let raw = buffer;
+
+        if (this._authKey20) {
+            const stripped = this._stripAndVerifyIpscAuth(buffer);
+            if (!stripped) {
+                console.log("[ipsc] auth verify failed, trying plain parse...");
+                raw = buffer; // fallback without stripping
+            } else {
+                raw = stripped;
+            }
+        }
+
+        let packet = IPSC.Packet.from(raw);
+        if (packet === null) return;
 
         this.emit(IPSCPeer.EVENT_DATA, packet);
 
-        if(this.state === IPSCPeer.STATE_CONNECTING && packet instanceof IPSC.MasterRegReply) {
-            if(this.options.xnlEnabled) {
+        if (this.state === IPSCPeer.STATE_CONNECTING && packet instanceof IPSC.MasterRegReply) {
+            if (this.options.xnlEnabled) {
                 this.state = IPSCPeer.STATE_XNL_INIT;
                 this.xnlStarted = getTime();
                 let xnl = new XNL(XNL.OPCODE_DEVICE_MASTER_QUERY);
                 this.sendXNL(xnl);
-            } else if(this.options.wlEnabled) {
+            } else if (this.options.wlEnabled) {
                 this.initWireline();
             } else {
                 this.initDone();
@@ -196,21 +297,21 @@ class IPSCPeer extends EventEmitter {
             return;
         }
 
-        if(packet instanceof IPSC.MasterAliveReply) {
+        if (packet instanceof IPSC.MasterAliveReply) {
             this.lostPings = 0;
             return;
         }
 
-        if(packet instanceof  IPSC.PeerRegReq || packet instanceof IPSC.PeerAliveReq) {
-            if(this.options.wlEnabled && this.options.wlCapPusRevert) {
+        if (packet instanceof IPSC.PeerRegReq || packet instanceof IPSC.PeerAliveReq) {
+            if (this.options.wlEnabled && this.options.wlCapPusRevert) {
                 this.wlRevertPeer[0] = addr.address;
                 this.wlRevertPeer[1] = addr.port;
 
-                if(this.state===IPSCPeer.STATE_WL_INIT)
+                if (this.state === IPSCPeer.STATE_WL_INIT)
                     this.initDone();
 
                 let pkt;
-                if(packet instanceof  IPSC.PeerRegReq)
+                if (packet instanceof IPSC.PeerRegReq)
                     pkt = new IPSC.PeerRegReply(packet.peerProtocol);
                 else
                     pkt = new IPSC.PeerAliveReply(this.options.peerMode, this.options.peerFlags)
@@ -221,44 +322,44 @@ class IPSCPeer extends EventEmitter {
             return;
         }
 
-        if(packet instanceof IPSC.XNLPacket) {
+        if (packet instanceof IPSC.XNLPacket) {
             this.onXNLData(packet.xnl);
             return;
         }
 
-        if(packet instanceof IPSC.Wireline) {
+        if (packet instanceof IPSC.Wireline) {
             this.onWlData(packet);
             return;
         }
 
-        if(packet instanceof IPSC.RepeaterBlock || packet instanceof IPSC.PrivateData || packet instanceof IPSC.GroupData || packet instanceof IPSC.PrivateVoice || packet instanceof IPSC.GroupVoice)
+        if (packet instanceof IPSC.RepeaterBlock || packet instanceof IPSC.PrivateData || packet instanceof IPSC.GroupData || packet instanceof IPSC.PrivateVoice || packet instanceof IPSC.GroupVoice)
             this.lastDataPacket = getTime();
 
-        if(packet instanceof IPSC.RepeaterBlock) {
+        if (packet instanceof IPSC.RepeaterBlock) {
             this.isTXActive = packet.status === IPSC.RepeaterBlock.SIGNAL_INTERFERENCE1_END;
             return;
         }
 
-        if(packet instanceof IPSC.PrivateData || packet instanceof  IPSC.GroupData) {
+        if (packet instanceof IPSC.PrivateData || packet instanceof IPSC.GroupData) {
             this.emit(IPSCPeer.EVENT_DMRDATA, {
                 data: packet.dmrPayload.data,
                 src_id: packet.src_id,
                 dst_id: packet.dst_id,
-                dstIsGroup: packet instanceof  IPSC.GroupData,
+                dstIsGroup: packet instanceof IPSC.GroupData,
                 slot: packet.slot
             });
         }
 
-        if(packet instanceof IPSC.PrivateVoice || packet instanceof IPSC.GroupVoice) {
-            if(packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE_HEADER)
-                this.voiceLcData[packet.slot] = packet.dmrPayload.data.LC;
-            else if(packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE && packet.dmrPayload.embLCPresent)
+        if (packet instanceof IPSC.PrivateVoice || packet instanceof IPSC.GroupVoice) {
+            if (packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE_HEADER)
+                this.voiceLcData[packet.slot] = packet.dmrPayload.data?.LC;
+            else if (packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE && packet.dmrPayload.embLCPresent)
                 this.voiceLcData[packet.slot] = packet.dmrPayload.embLC;
 
-            if(this.voiceLcData[packet.slot]!==undefined) {
+            if (this.voiceLcData[packet.slot] !== undefined) {
                 let ambe = [];
 
-                if(packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE) {
+                if (packet.dmrPayload.pduDataType === DMRPayload.DATA_TYPE_VOICE) {
                     ambe = [
                         packet.dmrPayload.ambe1,
                         packet.dmrPayload.ambe2,
@@ -268,8 +369,8 @@ class IPSCPeer extends EventEmitter {
                 this.emit(IPSCPeer.EVENT_VOICEDATA, {
                     lc: this.voiceLcData[packet.slot],
                     dataType: packet.dmrPayload.pduDataType,
-                    dstIsGroup:  packet instanceof IPSC.GroupVoice,
-                    ambe:ambe,
+                    dstIsGroup: packet instanceof IPSC.GroupVoice,
+                    ambe: ambe,
                     slot: packet.slot
                 })
             }
@@ -277,13 +378,13 @@ class IPSCPeer extends EventEmitter {
     }
 
     onWlData(packet) {
-        if(!this.options.wlEnabled)
+        if (!this.options.wlEnabled)
             return;
 
-        if(packet instanceof Wireline.RegistrationReply) {
-            if(packet.statusType===Wireline.RegistrationReply.STATUS_TYPE_SUCCESS) {
+        if (packet instanceof Wireline.RegistrationReply) {
+            if (packet.statusType === Wireline.RegistrationReply.STATUS_TYPE_SUCCESS) {
 
-                if(this.options.wlCapPusRevert)
+                if (this.options.wlCapPusRevert)
                     this.send(new IPSC.PeerListReq());
                 else
                     this.initDone();
@@ -294,7 +395,7 @@ class IPSCPeer extends EventEmitter {
             return;
         }
 
-        if(packet instanceof IPSC.Wireline) {
+        if (packet instanceof IPSC.Wireline) {
             this.emit(IPSCPeer.EVENT_WLDATA, {
                 data: packet
             });
@@ -302,10 +403,10 @@ class IPSCPeer extends EventEmitter {
     }
 
     onXNLData(xnl) {
-        if(!this.options.xnlEnabled)
+        if (!this.options.xnlEnabled)
             return;
 
-        if(xnl.opcode === XNL.OPCODE_DATA_MESSAGE) {
+        if (xnl.opcode === XNL.OPCODE_DATA_MESSAGE) {
             let replyPacket = new XNL(XNL.OPCODE_DATA_MESSAGE_ACK);
 
             replyPacket.dst = xnl.src;
@@ -316,13 +417,13 @@ class IPSCPeer extends EventEmitter {
 
             this.sendXNL(replyPacket);
 
-            if(xnl.isXCMP)
+            if (xnl.isXCMP)
                 this.emit(IPSCPeer.EVENT_XCMPDATA, xnl.data);
 
             return;
         }
 
-        if(this.state === IPSCPeer.STATE_XNL_INIT) {
+        if (this.state === IPSCPeer.STATE_XNL_INIT) {
             if (xnl.opcode === XNL.OPCODE_MASTER_STATUS_BROADCAST) {
                 this.xnlPeerId = xnl.src;
 
@@ -350,7 +451,7 @@ class IPSCPeer extends EventEmitter {
             if (xnl.opcode === XNL.OPCODE_DEVICE_CONNECTION_REPLY) {
                 this.xnlLocalId = xnl.data.readUInt16BE(2);
 
-                if(this.options.wlEnabled) {
+                if (this.options.wlEnabled) {
                     this.initWireline();
                 } else {
                     this.initDone();
@@ -360,15 +461,15 @@ class IPSCPeer extends EventEmitter {
     }
 
     sendXCMP(xcmp) {
-        if(!this.options.xnlEnabled)
+        if (!this.options.xnlEnabled)
             return;
 
-        if(this.xnlTXId> 65000)
+        if (this.xnlTXId > 65000)
             this.xnlTXId = 0;
         else
             this.xnlTXId++;
 
-        if(this.xnlRequestFlag > 6)
+        if (this.xnlRequestFlag > 6)
             this.xnlRequestFlag = 0;
         else
             this.xnlRequestFlag++;
@@ -386,7 +487,7 @@ class IPSCPeer extends EventEmitter {
     }
 
     sendXNL(xnl) {
-        if(!this.options.xnlEnabled)
+        if (!this.options.xnlEnabled)
             return;
 
         let ipsc = new IPSC.XNLPacket(xnl);
@@ -394,8 +495,8 @@ class IPSCPeer extends EventEmitter {
         this.send(ipsc);
     }
 
-    sendDMRData(data, src_id, dst_id, dstIsGroup, isFirst, isLast, slot=0) {
-        if(this.dmrSeq>=65535)
+    sendDMRData(data, src_id, dst_id, dstIsGroup, isFirst, isLast, slot = 0) {
+        if (this.dmrSeq >= 65535)
             this.dmrSeq = 0;
         else
             this.dmrSeq++;
@@ -433,11 +534,11 @@ class IPSCPeer extends EventEmitter {
         packet.lastPacket = isLast;
         packet.rtp = rtpPayload;
         packet.dmrPayload = dmrPayload;
-// console.log(packet);
+        // console.log(packet);
         this.sendDataBuffer.push(packet);
 
-        if(isLast) {
-            if(this.streamId>=255)
+        if (isLast) {
+            if (this.streamId >= 255)
                 this.streamId = 0;
             else
                 this.streamId++;
@@ -445,10 +546,10 @@ class IPSCPeer extends EventEmitter {
     }
 
     intervalFunction() {
-        if(this.state===IPSCPeer.STATE_NONE)
+        if (this.state === IPSCPeer.STATE_NONE)
             return;
 
-        if(this.state!==IPSCPeer.STATE_OK || this.lostPings > 2) {
+        if (this.state !== IPSCPeer.STATE_OK || this.lostPings > 2) {
             this.close(); //Close by timeout
             return;
         }
@@ -459,14 +560,14 @@ class IPSCPeer extends EventEmitter {
     }
 
     async dataPacketSender() {
-        if(this.state !== IPSCPeer.STATE_OK || this.sendDataBuffer.length===0 || this.lastDataPacket + 500 > getTime() || (this.options.sendDataWhenActive && !this.isTXActive)) {
+        if (this.state !== IPSCPeer.STATE_OK || this.sendDataBuffer.length === 0 || this.lastDataPacket + 500 > getTime() || (this.options.sendDataWhenActive && !this.isTXActive)) {
             setTimeout(() => {
                 this.dataPacketSender();
             }, 50);
             return;
         }
 
-        while(this.sendDataBuffer.length > 0) {
+        while (this.sendDataBuffer.length > 0) {
             let p = this.sendDataBuffer.shift();
             this.send(p);
             // console.log('S: '+p.getBuffer().toString('hex')+ ' ['+this.sendDataBuffer.length+']');
